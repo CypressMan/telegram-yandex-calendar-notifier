@@ -73,6 +73,7 @@ type Config struct {
 	BotToken         string
 	UsersFile        string
 	PollEvery        time.Duration
+	CacheTTL         time.Duration
 	DigestTime       string
 	Timezone         string
 	HTTPTimeout      time.Duration
@@ -85,6 +86,18 @@ type Config struct {
 type ReminderEngine struct {
 	mu   sync.Mutex
 	sent map[string]time.Time
+}
+
+type UserEventsCacheEntry struct {
+	Events      []Event
+	RefreshedAt time.Time
+	Err         error
+}
+
+type UserEventsCache struct {
+	mu   sync.RWMutex
+	ttl  time.Duration
+	data map[int64]UserEventsCacheEntry
 }
 
 type InputMode string
@@ -144,13 +157,14 @@ func main() {
 
 	httpClient := &http.Client{Timeout: cfg.HTTPTimeout}
 	engine := &ReminderEngine{sent: make(map[string]time.Time)}
+	eventsCache := NewUserEventsCache(cfg.CacheTTL)
 	inputStates := &InputStateStore{state: make(map[int64]InputMode)}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go runReminderLoop(ctx, bot, store, httpClient, cfg.PollEvery, loc, engine)
-	go runDailyDigestLoop(ctx, bot, store, httpClient, cfg.DigestTime, loc)
+	go runReminderLoop(ctx, bot, store, eventsCache, httpClient, cfg.PollEvery, loc, engine)
+	go runDailyDigestLoop(ctx, bot, store, eventsCache, httpClient, cfg.DigestTime, loc)
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 30
@@ -160,7 +174,7 @@ func main() {
 		if update.Message == nil {
 			continue
 		}
-		handleMessage(bot, store, inputStates, httpClient, loc, cfg.HelpImagePath, update.Message)
+		handleMessage(bot, store, eventsCache, inputStates, httpClient, loc, cfg.HelpImagePath, update.Message)
 	}
 }
 
@@ -169,6 +183,7 @@ func loadConfig() (Config, error) {
 		BotToken:         strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
 		UsersFile:        envOrDefault("USERS_FILE", "data/users.json"),
 		PollEvery:        durationEnvOrDefault("POLL_EVERY", 5*time.Minute),
+		CacheTTL:         durationEnvOrDefault("CACHE_TTL", 60*time.Second),
 		DigestTime:       envOrDefault("DAILY_DIGEST_TIME", "10:00"),
 		Timezone:         envOrDefault("TZ_LOCATION", "Europe/Moscow"),
 		HTTPTimeout:      durationEnvOrDefault("HTTP_TIMEOUT", 20*time.Second),
@@ -427,7 +442,7 @@ func ensureParentDir(filePath string) error {
 	return os.MkdirAll(parent, 0o755)
 }
 
-func handleMessage(bot *tgbotapi.BotAPI, store *UsersStore, inputStates *InputStateStore, client *http.Client, loc *time.Location, helpImagePath string, m *tgbotapi.Message) {
+func handleMessage(bot *tgbotapi.BotAPI, store *UsersStore, eventsCache *UserEventsCache, inputStates *InputStateStore, client *http.Client, loc *time.Location, helpImagePath string, m *tgbotapi.Message) {
 	if m.From == nil {
 		return
 	}
@@ -451,7 +466,7 @@ func handleMessage(bot *tgbotapi.BotAPI, store *UsersStore, inputStates *InputSt
 			sendErrorText(bot, chatID, "❌ Не удалось разобрать ссылки.", err)
 			return
 		}
-		handleSetURLs(bot, store, chatID, userID, username, urls)
+		handleSetURLs(bot, store, eventsCache, client, loc, chatID, userID, username, urls)
 		return
 	}
 
@@ -525,7 +540,7 @@ func handleMessage(bot *tgbotapi.BotAPI, store *UsersStore, inputStates *InputSt
 			sendText(bot, chatID, "🔒 Сначала укажите email и хотя бы одну ICal ссылку.")
 			return
 		}
-		events, err := fetchEventsForUser(client, u, loc)
+		events, err := getOrRefreshUserEvents(eventsCache, client, u, loc)
 		if err != nil {
 			sendErrorText(bot, chatID, "❌ Не удалось получить календарь. Проверьте ссылку и попробуйте снова.", err)
 			return
@@ -562,6 +577,13 @@ func handleMessage(bot *tgbotapi.BotAPI, store *UsersStore, inputStates *InputSt
 				sendErrorText(bot, chatID, "❌ Не удалось сохранить email.", err)
 				return
 			}
+			if u, ok := store.Get(userID); ok {
+				go func(usr UserRecord) {
+					if _, err := refreshUserEventsCache(eventsCache, client, usr, loc); err != nil {
+						log.Printf("cache warmup failed after email update: user=%d err=%v", usr.TelegramUserID, err)
+					}
+				}(u)
+			}
 			inputStates.Set(userID, modeURLs)
 			sendText(bot, chatID, "✅ Email сохранен.")
 			sendText(bot, chatID, "🔗 Шаг 2/2. Теперь отправьте одну или несколько ICal ссылок.")
@@ -575,14 +597,14 @@ func handleMessage(bot *tgbotapi.BotAPI, store *UsersStore, inputStates *InputSt
 				sendErrorText(bot, chatID, "❌ Не удалось разобрать ссылки.", err)
 				return
 			}
-			handleSetURLs(bot, store, chatID, userID, username, urls)
+			handleSetURLs(bot, store, eventsCache, client, loc, chatID, userID, username, urls)
 			inputStates.Clear(userID)
 		}
 		return
 	}
 
 	if urls, err := parseICalURLsInput(text); err == nil && len(urls) > 0 {
-		handleSetURLs(bot, store, chatID, userID, username, urls)
+		handleSetURLs(bot, store, eventsCache, client, loc, chatID, userID, username, urls)
 		return
 	}
 
@@ -590,6 +612,13 @@ func handleMessage(bot *tgbotapi.BotAPI, store *UsersStore, inputStates *InputSt
 		if err := store.SetEmail(userID, text); err != nil {
 			sendErrorText(bot, chatID, "❌ Не удалось сохранить email.", err)
 			return
+		}
+		if u, ok := store.Get(userID); ok {
+			go func(usr UserRecord) {
+				if _, err := refreshUserEventsCache(eventsCache, client, usr, loc); err != nil {
+					log.Printf("cache warmup failed after email update: user=%d err=%v", usr.TelegramUserID, err)
+				}
+			}(u)
 		}
 		sendText(bot, chatID, "✅ Email сохранен.")
 		sendKeyboard(bot, store, chatID, userID)
@@ -602,7 +631,7 @@ func handleMessage(bot *tgbotapi.BotAPI, store *UsersStore, inputStates *InputSt
 	}
 }
 
-func handleSetURLs(bot *tgbotapi.BotAPI, store *UsersStore, chatID int64, userID int64, username string, urls []string) {
+func handleSetURLs(bot *tgbotapi.BotAPI, store *UsersStore, eventsCache *UserEventsCache, client *http.Client, loc *time.Location, chatID int64, userID int64, username string, urls []string) {
 	log.Printf("set url attempt: id=%d username=%q", userID, username)
 	if len(urls) == 0 {
 		log.Printf("set url rejected: id=%d username=%q reason=invalid_url", userID, username)
@@ -615,6 +644,13 @@ func handleSetURLs(bot *tgbotapi.BotAPI, store *UsersStore, chatID int64, userID
 		return
 	}
 	log.Printf("set url success: id=%d username=%q urls=%d", userID, username, len(urls))
+	if u, ok := store.Get(userID); ok {
+		go func(usr UserRecord) {
+			if _, err := refreshUserEventsCache(eventsCache, client, usr, loc); err != nil {
+				log.Printf("cache warmup failed after urls update: user=%d err=%v", usr.TelegramUserID, err)
+			}
+		}(u)
+	}
 	sendText(bot, chatID, fmt.Sprintf("✅ Ссылки сохранены (%d). Теперь можно использовать кнопки событий.", len(urls)))
 	sendKeyboard(bot, store, chatID, userID)
 }
@@ -775,14 +811,149 @@ func (s *InputStateStore) Clear(userID int64) {
 	delete(s.state, userID)
 }
 
+func NewUserEventsCache(ttl time.Duration) *UserEventsCache {
+	if ttl <= 0 {
+		ttl = 60 * time.Second
+	}
+	return &UserEventsCache{
+		ttl:  ttl,
+		data: make(map[int64]UserEventsCacheEntry),
+	}
+}
+
+func (c *UserEventsCache) GetFresh(userID int64) ([]Event, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	e, ok := c.data[userID]
+	if !ok {
+		return nil, false
+	}
+	if time.Since(e.RefreshedAt) > c.ttl {
+		return nil, false
+	}
+	return e.Events, true
+}
+
+func (c *UserEventsCache) Set(userID int64, events []Event, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.data[userID] = UserEventsCacheEntry{
+		Events:      events,
+		RefreshedAt: time.Now(),
+		Err:         err,
+	}
+}
+
+func getOrRefreshUserEvents(cache *UserEventsCache, client *http.Client, u UserRecord, loc *time.Location) ([]Event, error) {
+	if events, ok := cache.GetFresh(u.TelegramUserID); ok {
+		return events, nil
+	}
+	return refreshUserEventsCache(cache, client, u, loc)
+}
+
+func refreshUserEventsCache(cache *UserEventsCache, client *http.Client, u UserRecord, loc *time.Location) ([]Event, error) {
+	events, err := fetchEventsForUser(client, u, loc)
+	cache.Set(u.TelegramUserID, events, err)
+	return events, err
+}
+
 func sendText(bot *tgbotapi.BotAPI, chatID int64, text string) {
 	_ = sendTextErr(bot, chatID, text)
 }
 
 func sendTextErr(bot *tgbotapi.BotAPI, chatID int64, text string) error {
-	msg := tgbotapi.NewMessage(chatID, text)
-	_, err := bot.Send(msg)
-	return err
+	for _, part := range splitMessageText(text, 3500) {
+		msg := tgbotapi.NewMessage(chatID, part)
+		if _, err := bot.Send(msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitMessageText(text string, maxRunes int) []string {
+	if maxRunes <= 0 {
+		maxRunes = 3500
+	}
+	r := []rune(text)
+	if len(r) <= maxRunes {
+		return []string{text}
+	}
+
+	// Keep event blocks intact when text contains event separators.
+	eventSeparator := "\n━━━━━━━━━━━━━━\n\n"
+	if strings.Contains(text, eventSeparator) {
+		return splitBySeparator(text, eventSeparator, maxRunes)
+	}
+
+	parts := make([]string, 0, (len(r)/maxRunes)+1)
+	for len(r) > maxRunes {
+		split := maxRunes
+		for i := maxRunes; i > maxRunes/2; i-- {
+			if r[i] == '\n' {
+				split = i + 1
+				break
+			}
+		}
+		parts = append(parts, strings.TrimSpace(string(r[:split])))
+		r = r[split:]
+	}
+	if len(r) > 0 {
+		parts = append(parts, strings.TrimSpace(string(r)))
+	}
+
+	// guard against empty chunks after TrimSpace
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return []string{text}
+	}
+	return out
+}
+
+func splitBySeparator(text, sep string, maxRunes int) []string {
+	blocks := strings.Split(text, sep)
+	result := make([]string, 0, len(blocks))
+	current := ""
+
+	for _, raw := range blocks {
+		block := strings.TrimSpace(raw)
+		if block == "" {
+			continue
+		}
+
+		candidate := block
+		if current != "" {
+			candidate = current + sep + block
+		}
+
+		if len([]rune(candidate)) <= maxRunes {
+			current = candidate
+			continue
+		}
+
+		if current != "" {
+			result = append(result, strings.TrimSpace(current))
+		}
+
+		// If one block is too large, fallback to generic split for this block.
+		if len([]rune(block)) > maxRunes {
+			result = append(result, splitMessageText(block, maxRunes)...)
+			current = ""
+			continue
+		}
+		current = block
+	}
+
+	if strings.TrimSpace(current) != "" {
+		result = append(result, strings.TrimSpace(current))
+	}
+
+	return result
 }
 
 func sendPhotoErr(bot *tgbotapi.BotAPI, chatID int64, imagePath, caption string) error {
@@ -1244,29 +1415,29 @@ func formatEventLine(e Event, loc *time.Location) string {
 	return strings.Join(lines, "\n")
 }
 
-func runReminderLoop(ctx context.Context, bot *tgbotapi.BotAPI, store *UsersStore, client *http.Client, interval time.Duration, loc *time.Location, engine *ReminderEngine) {
+func runReminderLoop(ctx context.Context, bot *tgbotapi.BotAPI, store *UsersStore, eventsCache *UserEventsCache, client *http.Client, interval time.Duration, loc *time.Location, engine *ReminderEngine) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	engine.checkAndNotify(bot, store, client, loc, interval)
+	engine.checkAndNotify(bot, store, eventsCache, client, loc, interval)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			engine.checkAndNotify(bot, store, client, loc, interval)
+			engine.checkAndNotify(bot, store, eventsCache, client, loc, interval)
 		}
 	}
 }
 
-func (r *ReminderEngine) checkAndNotify(bot *tgbotapi.BotAPI, store *UsersStore, client *http.Client, loc *time.Location, interval time.Duration) {
+func (r *ReminderEngine) checkAndNotify(bot *tgbotapi.BotAPI, store *UsersStore, eventsCache *UserEventsCache, client *http.Client, loc *time.Location, interval time.Duration) {
 	now := time.Now().In(loc)
 	users := store.List()
 	for _, u := range users {
 		if !userReady(u) {
 			continue
 		}
-		events, err := fetchEventsForUser(client, u, loc)
+		events, err := getOrRefreshUserEvents(eventsCache, client, u, loc)
 		if err != nil {
 			log.Printf("reminder: user %d fetch failed: %v", u.TelegramUserID, err)
 			continue
@@ -1322,7 +1493,7 @@ func (r *ReminderEngine) cleanup(now time.Time) {
 	}
 }
 
-func runDailyDigestLoop(ctx context.Context, bot *tgbotapi.BotAPI, store *UsersStore, client *http.Client, digestHHMM string, loc *time.Location) {
+func runDailyDigestLoop(ctx context.Context, bot *tgbotapi.BotAPI, store *UsersStore, eventsCache *UserEventsCache, client *http.Client, digestHHMM string, loc *time.Location) {
 	hour, minute, _ := parseClockHHMM(digestHHMM)
 
 	for {
@@ -1338,12 +1509,12 @@ func runDailyDigestLoop(ctx context.Context, bot *tgbotapi.BotAPI, store *UsersS
 			timer.Stop()
 			return
 		case <-timer.C:
-			sendDailyDigest(bot, store, client, loc)
+			sendDailyDigest(bot, store, eventsCache, client, loc)
 		}
 	}
 }
 
-func sendDailyDigest(bot *tgbotapi.BotAPI, store *UsersStore, client *http.Client, loc *time.Location) {
+func sendDailyDigest(bot *tgbotapi.BotAPI, store *UsersStore, eventsCache *UserEventsCache, client *http.Client, loc *time.Location) {
 	today := time.Now().In(loc)
 	for _, u := range store.List() {
 		if !userReady(u) {
@@ -1352,7 +1523,7 @@ func sendDailyDigest(bot *tgbotapi.BotAPI, store *UsersStore, client *http.Clien
 		if !u.WeekendEnabled && isWeekend(today) {
 			continue
 		}
-		events, err := fetchEventsForUser(client, u, loc)
+		events, err := getOrRefreshUserEvents(eventsCache, client, u, loc)
 		if err != nil {
 			log.Printf("daily digest: user %d fetch failed: %v", u.TelegramUserID, err)
 			continue
